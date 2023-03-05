@@ -25,10 +25,12 @@ def transcribe_audio(audio: np.ndarray, sample_rate: int) -> str:
                                          memory_file)
         return result.text
 
-async def record(output: Static, stop_recording: asyncio.Event) -> None:
-    mic = sd.query_devices(DEVICE_NAME)
-    sample_rate = int(mic["default_samplerate"])
+async def record(output: Static, 
+                 device: dict,
+                 stop_recording: asyncio.Event) -> None:
     data = None
+    sample_rate = int(device["default_samplerate"])
+    device_name = device["name"]
 
     def callback(indata, frames, time, status):
         nonlocal data
@@ -39,7 +41,7 @@ async def record(output: Static, stop_recording: asyncio.Event) -> None:
             data = np.append(data, audio_data)
 
     with sd.InputStream(samplerate=sample_rate, 
-                        device=mic["name"], 
+                        device=device_name,
                         callback=callback):
         await stop_recording.wait()
         transcription = transcribe_audio(data, sample_rate)
@@ -52,6 +54,7 @@ class App(App):
 
     # TODO: is this used for 1 time init?
     def on_mount(self) -> None:
+        self.device = sd.query_devices(DEVICE_NAME)
         self.stop_recording_event = asyncio.Event()
 
     def compose(self) -> ComposeResult:
@@ -69,7 +72,9 @@ class App(App):
 
         if event.button.id == "start":
             self.stop_recording_event.clear()
-            asyncio.create_task(record(transcript, self.stop_recording_event))
+            asyncio.create_task(record(transcript, 
+                                       self.device, 
+                                       self.stop_recording_event))
         elif event.button.id == "stop":
             self.stop_recording_event.set()
 
