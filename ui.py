@@ -7,14 +7,15 @@ import sounddevice as sd
 import soundfile as sf
 from openai import Audio, ChatCompletion
 from textual.app import App, ComposeResult
-from textual.widgets import Header, Footer, Button, Static, TextLog
+from textual.widgets import Header, Footer, Button, Static, TextLog, Label
 
 # TODO:
-# 1. Add checkbox for real-time transcription
-# 2. Add checkbox for audio playback
-# 3. Keep entire recording of prompt and transcribe it for chat
-# 4. Write logic for chat stop phrase "What do you think?"
-# 5. Write logic for command stop phrase "Make it so."
+# DONE 0. Add CSS
+# 1. Keep entire recording of prompt and transcribe it for chat
+# 2. Write logic for chat stop phrase "What do you think?"
+# 3. Write logic for command stop phrase "Make it so."
+# 4. Add checkbox for real-time transcription
+# 5. Add checkbox for audio playback
 
 DEVICE_NAME = "MacBook Pro Microphone"
 STT_MODEL_NAME = "whisper-1"
@@ -99,6 +100,9 @@ async def write_transcript(transcriptions: list[str],
         await asyncio.sleep(0)
 
 class App(App):
+    CSS_PATH = "style.css"
+    TITLE = "Jarvis"
+    SUB_TITLE = "Speak to Jarvis"
     BINDINGS = [
         ("q", "quit", "Quit the application")
     ]
@@ -117,9 +121,12 @@ class App(App):
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Static("...", id="transcript")
-        yield Button("Record", id="start_stop")
-        yield TextLog(id="log", wrap=True)
+        yield Container(
+            Label("You:"),
+            Static("...", id="transcript", classes="input"),
+            Button("Record", id="start_stop"),
+            TextLog(id="log", wrap=True)
+        )
         yield Footer()
 
     def action_quit(self) -> None:
