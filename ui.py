@@ -7,11 +7,9 @@ import sounddevice as sd
 import soundfile as sf
 from openai import Audio, ChatCompletion
 from textual.app import App, ComposeResult
+from textual.containers import Container
 from textual.widgets import Header, Footer, Button, Static, TextLog, Label
 
-# TODO:
-# DONE 0. Add CSS
-# 1. Keep entire recording of prompt and transcribe it for chat
 # 2. Write logic for chat stop phrase "What do you think?"
 # 3. Write logic for command stop phrase "Make it so."
 # 4. Add checkbox for real-time transcription
@@ -30,53 +28,80 @@ generalities or cliches. I'd like you to have a dialogue with me about an idea
 that I have.
 """
 
-def transcribe(audio: io.BytesIO, prompt: str = "") -> str:
-    result = Audio.transcribe(STT_MODEL_NAME, audio, prompt=prompt)
-    return result.text
+class Transcription:
+    """A class for storing and manipulating transcriptions."""
+    def __init__(self):
+        self.transcript_chunks = []
+        self.transcript_full = ""
 
-async def transcribe_audio(transcripts: list[str],
-                           audio: np.ndarray, 
-                           sample_rate: int) -> None:
-    """Asynchronously transcribe audio data."""
+def transcribe(audio: np.ndarray, sample_rate: int, prompt: str = "") -> str:
+    """Transcribe audio data and return transcript"""
     with io.BytesIO() as memory_file:
         memory_file.name = "stream.wav"
         sf.write(memory_file, audio, sample_rate, format="WAV")
         memory_file.seek(0)
+        response = Audio.transcribe(STT_MODEL_NAME, 
+                                    memory_file, 
+                                    prompt=prompt)
+        return response.text
 
-        prompt = str.join(" ", transcripts)
-        transcripts.append("...")
-        task_id = len(transcripts) - 1
+async def transcribe_audio_chunk(transcription: Transcription,
+                                 audio: np.ndarray,
+                                 sample_rate: int) -> None:
+    prompt = str.join(" ", transcription.transcript_chunks)
+    transcription.transcript_chunks.append("...")
+    task_id = len(transcription.transcript_chunks) - 1
 
-        loop = asyncio.get_running_loop()
-        with concurrent.futures.ThreadPoolExecutor() as pool:
-            transcript = await loop.run_in_executor(pool, 
-                                                    transcribe,
-                                                    memory_file,
-                                                    prompt)
-            transcripts[task_id] = transcript
+    loop = asyncio.get_running_loop()
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        transcript = await loop.run_in_executor(pool, 
+                                                transcribe,
+                                                audio,
+                                                sample_rate,
+                                                prompt)
+        print(f"audio chunk: {transcript}")
+        transcription.transcript_chunks[task_id] = transcript
+    
+async def transcribe_audio_full(transcription: Transcription,
+                                audio: np.ndarray,
+                                sample_rate: int) -> None:
+    loop = asyncio.get_running_loop()
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        transcript = await loop.run_in_executor(pool, 
+                                                transcribe,
+                                                audio,
+                                                sample_rate)
+        print(f"audio full: {transcript}")
+        transcription.transcript_full = transcript
 
-async def record(transcripts: list[str], 
+async def record(transcription: Transcription, 
                  device_name: str,
                  sample_rate: int,
                  stop_recording: asyncio.Event) -> None:
     """Record audio and transcribe audio in the background using device"""
-    data = None
+    audio_chunk = None
+    audio_full = None
     q = queue.Queue()
 
     def callback(indata, frames, time, status):
-        nonlocal data
+        nonlocal audio_chunk, audio_full
         audio_data = np.frombuffer(indata, dtype="float32")
-        if data is None:
-            data = audio_data
+        if audio_chunk is None:
+            audio_chunk = audio_data
         else:
             rms = np.sqrt(np.mean(np.square(audio_data)))
             if rms < THRESHOLD:
-                duration = data.size / sample_rate
+                duration = audio_chunk.size / sample_rate
                 if duration > MIN_DURATION:
-                    q.put(data.copy())
-                    data = None
+                    print(f"asyncing an audio chunk")
+                    q.put(audio_chunk.copy())
+                    if audio_full is None:
+                        audio_full = audio_chunk.copy()
+                    else:
+                        audio_full = np.append(audio_full, audio_chunk)
+                    audio_chunk = None
             else:
-                data = np.append(data, audio_data)
+                audio_chunk = np.append(audio_chunk, audio_data)
 
     with sd.InputStream(samplerate=sample_rate, 
                         blocksize=int(sample_rate / 2),
@@ -85,18 +110,25 @@ async def record(transcripts: list[str],
         while not stop_recording.is_set():
             while not q.empty():
                 audio = q.get()
-                await transcribe_audio(transcripts, audio, sample_rate)
+                await transcribe_audio_chunk(transcription, 
+                                             audio, 
+                                             sample_rate)
             await asyncio.sleep(0.1)
-        await transcribe_audio(transcripts, data, sample_rate)
+        if audio_chunk is not None:
+            await transcribe_audio_chunk(transcription, 
+                                         audio_chunk, 
+                                         sample_rate)
+        if audio_full is None:
+            audio_full = audio_chunk
+        await transcribe_audio_full(transcription, audio_full, sample_rate)
 
-async def write_transcript(transcriptions: list[str],
-                           output: Static,
-                           stop_recording: asyncio.Event) -> None:
-    """Write transcript to output widget"""
+async def write_transcript(transcription: Transcription,
+                           output: Static) -> None:
+    """Write transcription chunks incrementally to output widget"""
     while True:
-        if len(transcriptions) > 0:
-            transcription = str.join(" ", transcriptions)
-            output.update(transcription)
+        if len(transcription.transcript_chunks) > 0:
+            full_text = str.join(" ", transcription.transcript_chunks)
+            output.update(full_text)
         await asyncio.sleep(0)
 
 class App(App):
@@ -107,17 +139,18 @@ class App(App):
         ("q", "quit", "Quit the application")
     ]
 
-    def on_mount(self) -> None:
+    async def on_mount(self) -> None:
         self.device = sd.query_devices(DEVICE_NAME)
         self.stop_recording_event = asyncio.Event()
         self.recording = False
-        self.transcripts = []
+        self.transcription = Transcription()
         self.history = []
 
         transcript = self.query_one("#transcript")
-        asyncio.create_task(write_transcript(self.transcripts,
-                                             transcript,
-                                             self.stop_recording_event))
+        self.write_task = asyncio.create_task(
+            write_transcript(self.transcription,
+                             transcript)
+        )
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -136,39 +169,41 @@ class App(App):
         if event.button.id == "start_stop":
             if not self.recording:
                 self.recording = True
-                self.transcripts.clear()
+                self.transcription.transcript_chunks.clear()
+                self.transcription.transcript_full = ""
                 self.stop_recording_event.clear()
                 event.button.label = "Stop"
                 device_name = self.device["name"]
                 sample_rate = int(self.device["default_samplerate"])
-                asyncio.create_task(record(self.transcripts, 
-                                        device_name, 
-                                        sample_rate,
-                                        self.stop_recording_event))
+                self.record_task = asyncio.create_task(
+                    record(self.transcription, 
+                          device_name, 
+                          sample_rate,
+                          self.stop_recording_event)
+                )
             else:
                 self.recording = False
                 self.stop_recording_event.set()
                 event.button.label = "Record"
 
-                # TODO: perhaps send the entire buffered audio to the API
-                # instead of using the incremental transcription
-                transcription = str.join(" ", self.transcripts)
+                await self.record_task
+                full_text = self.transcription.transcript_full
 
                 text_log = self.query_one("#log")
-                text_log.write(f"YOU: {transcription}")
+                text_log.write(f"YOU: {full_text}")
 
                 messages = [{"role": "system", "content": SYSTEM_PROMPT}]
                 if len(self.history) > 0:
                     messages += self.history
 
-                messages.append({"role": "user", "content": transcription})
+                messages.append({"role": "user", "content": full_text})
                 response = ChatCompletion.create(
                     model=LLM_MODEL_NAME,
                     messages = messages
                 )
                 answer = response.choices[0].message.content
                 text_log.write(f"JARVIS: {answer}")
-                self.history.append({"role": "user", "content": transcription})
+                self.history.append({"role": "user", "content": full_text})
                 self.history.append({"role": "assistant", "content": answer})
 
 if __name__ == "__main__":
